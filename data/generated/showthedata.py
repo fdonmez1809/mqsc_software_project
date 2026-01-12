@@ -10,5 +10,5 @@ byte_array = np.frombuffer(byte_data, dtype=np.uint8)
 # Convert bytes → bits
 bit_array = np.unpackbits(byte_array)
 
-print("Total bits:", bit_array.shape[0])
+print("Number of bits:", bit_array.shape[0])
 print("First 64 bits:", bit_array[:64])
