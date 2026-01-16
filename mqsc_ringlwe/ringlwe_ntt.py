@@ -1,4 +1,5 @@
 import numpy as np
+from ntt import NTT_multiplication
 
 class RingLWE:
     def __init__(self, n, q, sigma):
@@ -14,18 +15,9 @@ class RingLWE:
 
     def multiply_polynomials(self, p1, p2):
         
-        initial_product = np.convolve(p1, p2).astype(int)
-        
-        while len(initial_product) > self.n:
-            initial_degree = len(initial_product) - 1
-            initial_coeff = initial_product[initial_degree]
-            degree_mod_n = (initial_degree % n)
-            n_amount = initial_degree // n
-            final_coeff = pow(-1, n_amount)*initial_coeff
-            initial_product = initial_product[:-1]
-            initial_product[degree_mod_n] += final_coeff
+        result = NTT_multiplication(p1.tolist(), p2.tolist(), self.n, self.q)
             
-        return initial_product % self.q
+        return np.array(result) % self.q
 
     def generate_error(self):
         error = np.random.normal(0, self.sigma, self.n)
