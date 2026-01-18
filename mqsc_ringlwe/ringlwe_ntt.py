@@ -1,5 +1,5 @@
 import numpy as np
-from ntt import NTT_multiplication
+from .ntt import NTT_multiplication
 
 class RingLWE:
     def __init__(self, n, q, sigma):
