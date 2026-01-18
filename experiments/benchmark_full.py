@@ -36,7 +36,36 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from mqsc_ringlwe.ringlwe_schoolbook import RingLWE as RingLWE_Schoolbook
-from mqsc_ringlwe.ringlwe_ntt import RingLWE as RingLWE_NTT
+# Kyber-style negacyclic NTT (q=3329, n=256) implemented in Python
+from mqsc_ringlwe.ntt_kyber_py import poly_mul as kyber_poly_mul
+
+
+class RingLWE_KyberNTT(RingLWE_Schoolbook):
+    """Adapter: use the Schoolbook RingLWE implementation, but replace polynomial
+    multiplication with Kyber-style NTT multiplication for the Kyber parameter set.
+
+    This benchmarks the speed impact of swapping only the poly-mul primitive.
+    """
+
+    def __init__(self, n: int, q: int, sigma: float = 0.0, **kwargs):
+        # RingLWE_Schoolbook in this repo does not accept a `seed` kwarg.
+        # Accept **kwargs so the adapter is robust to callers passing extra params.
+        if n != 256 or q != 3329:
+            raise ValueError(
+                f"Kyber NTT adapter supports only (n,q)=(256,3329). Got (n,q)=({n},{q})."
+            )
+        super().__init__(n=n, q=q, sigma=sigma)
+
+    def multiply_polynomials(self, a, b):
+        # NumPy 2.0: np.array(..., copy=False) can raise if a copy is required.
+        # Use asarray (copy if needed) and ensure contiguous buffers for speed/safety.
+        a_np = np.ascontiguousarray(np.asarray(a, dtype=np.int32) % self.q)
+        b_np = np.ascontiguousarray(np.asarray(b, dtype=np.int32) % self.q)
+        return kyber_poly_mul(a_np, b_np)
+
+
+# Alias used by the benchmark below
+RingLWE_NTT = RingLWE_KyberNTT
 
 
 def _now_ns() -> int:
@@ -81,6 +110,43 @@ def _peak_mem_kib_during(fn) -> float:
     return peak / 1024.0
 
 
+# ----------------------------
+# API-compat wrapper helpers
+# ----------------------------
+def _has_keypair_api(rlwe) -> bool:
+    return hasattr(rlwe, "keygen") and callable(getattr(rlwe, "keygen"))
+
+
+def _enc_dec_once(rlwe, msg: np.ndarray):
+    """
+    Runs one encrypt+decrypt using whichever API the RLWE object provides.
+
+    Supports:
+      A) keypair-style: (sk, pk)=keygen(); ct=encrypt(pk,msg); dec=decrypt(sk,ct)
+      B) shared-secret-style: s=generate_shared_secret(); ct=encrypt(s,msg); dec=decrypt(s,ct)
+    """
+    n = rlwe.n
+    if msg.shape[0] != n:
+        raise ValueError("msg length mismatch")
+
+    if _has_keypair_api(rlwe):
+        sk, pk = rlwe.keygen()
+        ct = rlwe.encrypt(pk, msg)
+        dec = rlwe.decrypt(sk, ct)
+        return dec
+
+    if hasattr(rlwe, "generate_shared_secret"):
+        s = rlwe.generate_shared_secret()
+    elif hasattr(rlwe, "generate_error"):
+        s = rlwe.generate_error()
+    else:
+        raise AttributeError("No key generator in RingLWE class.")
+
+    ct = rlwe.encrypt(s, msg)
+    dec = rlwe.decrypt(s, ct)
+    return dec
+
+
 def _supports_n(rlwe) -> (bool, str):
     """Smoke-test: multiplication + enc/dec once."""
     try:
@@ -90,17 +156,8 @@ def _supports_n(rlwe) -> (bool, str):
         b = np.random.randint(0, q, size=n, dtype=np.int64)
         _ = rlwe.multiply_polynomials(a, b)
 
-        # key may not exist in some versions; fallback to generate_error
-        if hasattr(rlwe, "generate_shared_secret"):
-            s = rlwe.generate_shared_secret()
-        elif hasattr(rlwe, "generate_error"):
-            s = rlwe.generate_error()
-        else:
-            return False, "No key generator (generate_shared_secret/generate_error missing)"
-
         msg = np.random.randint(0, 2, size=n, dtype=int)
-        c = rlwe.encrypt(s, msg)
-        _ = rlwe.decrypt(s, c)
+        _ = _enc_dec_once(rlwe, msg)
         return True, ""
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
@@ -142,24 +199,34 @@ def _bench_end_to_end(rlwe, trials: int, repeat: int, warmup: int, seed: int):
     n = rlwe.n
     rng = np.random.default_rng(seed)
 
-    # message blocks and keys (avoid counting keygen inside enc/dec timing)
+    # message blocks (avoid counting keygen inside enc/dec timing as much as possible)
     msgs = rng.integers(0, 2, size=(trials, n), dtype=int)
 
-    if hasattr(rlwe, "generate_shared_secret"):
-        keys = [rlwe.generate_shared_secret() for _ in range(trials)]
-    elif hasattr(rlwe, "generate_error"):
-        keys = [rlwe.generate_error() for _ in range(trials)]
+    # Prepare keys for the runs
+    if _has_keypair_api(rlwe):
+        keypairs = [rlwe.keygen() for _ in range(trials)]  # list of (sk, pk)
     else:
-        raise AttributeError("No key generator in RingLWE class.")
+        if hasattr(rlwe, "generate_shared_secret"):
+            keys = [rlwe.generate_shared_secret() for _ in range(trials)]
+        elif hasattr(rlwe, "generate_error"):
+            keys = [rlwe.generate_error() for _ in range(trials)]
+        else:
+            raise AttributeError("No key generator in RingLWE class.")
+        keypairs = keys  # store as keys for shared-secret mode
 
     idx = 0
 
     def run_one():
         nonlocal idx
-        s = keys[idx]
         m = msgs[idx]
-        c = rlwe.encrypt(s, m)
-        _ = rlwe.decrypt(s, c)
+        if _has_keypair_api(rlwe):
+            sk, pk = keypairs[idx]
+            ct = rlwe.encrypt(pk, m)
+            _ = rlwe.decrypt(sk, ct)
+        else:
+            s = keypairs[idx]
+            ct = rlwe.encrypt(s, m)
+            _ = rlwe.decrypt(s, ct)
         idx = (idx + 1) % trials
 
     # time per block (median + IQR)
@@ -178,10 +245,16 @@ def _bench_end_to_end(rlwe, trials: int, repeat: int, warmup: int, seed: int):
     mismatch_examples = []
 
     for i in range(trials):
-        s = keys[i]
         m = msgs[i]
-        c = rlwe.encrypt(s, m)
-        dec = rlwe.decrypt(s, c)
+        if _has_keypair_api(rlwe):
+            sk, pk = keypairs[i]
+            ct = rlwe.encrypt(pk, m)
+            dec = rlwe.decrypt(sk, ct)
+        else:
+            s = keypairs[i]
+            ct = rlwe.encrypt(s, m)
+            dec = rlwe.decrypt(s, ct)
+
         dec = np.array(dec, dtype=int)
 
         matches = (dec == m)
@@ -224,9 +297,14 @@ def _bench_ring_consistency(n: int, q: int, trials: int, seed: int):
     """Compare schoolbook vs NTT polynomial multiplication for random polynomials."""
     rng = np.random.default_rng(seed)
     rlwe_s = RingLWE_Schoolbook(n=n, q=q, sigma=0.0)  # sigma irrelevant here
-    rlwe_n = RingLWE_NTT(n=n, q=q, sigma=0.0)
 
-    # If NTT doesn't support this n, fail gracefully
+    # Kyber NTT adapter supports only (n,q)=(256,3329); other (n,q) pairs are skipped.
+    try:
+        rlwe_n = RingLWE_NTT(n=n, q=q, sigma=0.0)
+    except Exception as e:
+        return {"supported": False, "reason": f"NTT unsupported: {type(e).__name__}: {e}"}
+
+    # If either doesn't support this n, fail gracefully
     ok_s, err_s = _supports_n(rlwe_s)
     ok_n, err_n = _supports_n(rlwe_n)
     if not ok_s:
@@ -247,8 +325,6 @@ def _bench_ring_consistency(n: int, q: int, trials: int, seed: int):
 
         if ps.shape != pn.shape or np.any(ps != pn):
             mismatches += 1
-            # measure magnitude of differences modulo q (wrapped)
-            # compute minimal representative difference in [-q/2, q/2]
             diff = (pn - ps) % q
             diff = np.where(diff > q // 2, diff - q, diff)
             max_abs_diff = max(max_abs_diff, int(np.max(np.abs(diff))))
@@ -307,16 +383,24 @@ def main():
     print(header)
     print("-" * len(header))
 
-    rows = []
     for n in args.n:
-        # instantiate
         rlwe_s = RingLWE_Schoolbook(n=n, q=q, sigma=sigma)
-        rlwe_n = RingLWE_NTT(n=n, q=q, sigma=sigma)
+
+        # Kyber NTT adapter supports only (n,q)=(256,3329)
+        rlwe_n = None
+        ntt_init_err = ""
+        try:
+            rlwe_n = RingLWE_NTT(n=n, q=q, sigma=sigma)
+        except Exception as e:
+            ntt_init_err = f"{type(e).__name__}: {e}"
 
         ok_s, err_s = _supports_n(rlwe_s)
-        ok_n, err_n = _supports_n(rlwe_n)
+        if rlwe_n is None:
+            ok_n, err_n = False, ntt_init_err
+        else:
+            ok_n, err_n = _supports_n(rlwe_n)
 
-        # ring consistency (only if both supported)
+        # ring consistency
         if ok_s and ok_n:
             cons = _bench_ring_consistency(n=n, q=q, trials=args.consistency_trials, seed=seed + 999)
         else:
@@ -366,9 +450,6 @@ def main():
                 f"{ed['throughput_blocks_s']:>10.2f}"
             )
 
-            rows.append((n, method_name, mul, ed, peak_mem))
-
-        # print ring consistency summary per-n
         if cons.get("supported"):
             print(
                 f"  Ring consistency (n={n}): "
@@ -380,7 +461,6 @@ def main():
                 print(f"  Examples: {cons['examples']}")
         else:
             print(f"  Ring consistency (n={n}): {cons.get('reason')}")
-
         print()
 
     print("Notes:")
@@ -388,7 +468,7 @@ def main():
     print("- Peak memory uses tracemalloc (Python allocations), reported in KiB.")
     print("- Decryption success/bit accuracy are measured over --ed-trials messages.")
     print("- Ring consistency compares Schoolbook vs NTT multiplication outputs mod q.")
-    print("- If some n values are unsupported by your current NTT implementation, they are skipped.")
+    print("- If some n values are unsupported by your current implementation, they are skipped.")
 
 
 if __name__ == "__main__":
