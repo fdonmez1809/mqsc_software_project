@@ -19,8 +19,29 @@ class RingLWE:
         while len(initial_product) > self.n:
             initial_degree = len(initial_product) - 1
             initial_coeff = initial_product[initial_degree]
-            degree_mod_n = (initial_degree % n)
-            n_amount = initial_degree // n
+            degree_mod_n = (initial_degree % self.n)
+            n_amount = initial_degree // self.n
+            final_coeff = pow(-1, n_amount)*initial_coeff
+            initial_product = initial_product[:-1]
+            initial_product[degree_mod_n] += final_coeff
+            
+        return initial_product % self.q
+    
+    def multiply_polynomials_no_numPy(self, p1, p2):
+       
+        length = len(p1) + len(p2) - 1
+        initial_product = [0] * length
+        for i in range(len(p1)):
+            for j in range(len(p2)):
+                initial_product[i + j] += p1[i] * p2[j]
+        
+        initial_product = np.convolve(p1, p2).astype(int)
+        
+        while len(initial_product) > self.n:
+            initial_degree = len(initial_product) - 1
+            initial_coeff = initial_product[initial_degree]
+            degree_mod_n = (initial_degree % self.n)
+            n_amount = initial_degree // self.n
             final_coeff = pow(-1, n_amount)*initial_coeff
             initial_product = initial_product[:-1]
             initial_product[degree_mod_n] += final_coeff
@@ -53,7 +74,6 @@ class RingLWE:
     def decrypt(self, s, ciphertext):
         a, b = ciphertext
         
-        # 1. Remove the mask: b - a*s = (a*s + e + m) - a*s = e + m
         product_as = self.multiply_polynomials(a, s)
         message_with_noise = self.subtract_polynomials(b, product_as)
         
@@ -67,6 +87,27 @@ class RingLWE:
             else:
                 decrypted_bits.append(0)
         return decrypted_bits
+
+    def encrypt_no_numPy(self, s, message_bits):
+        a = self.generate_uniform()
+        
+        e = self.generate_error()
+        
+        message_poly = np.array(message_bits) * (self.q // 2)
+        
+        product = self.multiply_polynomials_no_numPy(a, s)
+        b = self.add_polynomials(product, e)
+        b = self.add_polynomials(b, message_poly)
+        
+        return a, b
+
+    def decrypt_no_numPy(self, s, ciphertext):
+        a, b = ciphertext
+        
+        product_as = self.multiply_polynomials_no_numPy(a, s)
+        message_with_noise = self.subtract_polynomials(b, product_as)
+        
+        return self.remove_message_noise(message_with_noise)
     
 n = 256        # ring dimension
 q = 3329       # modulus
