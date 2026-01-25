@@ -35,8 +35,6 @@ class RingLWE:
             for j in range(len(p2)):
                 initial_product[i + j] += p1[i] * p2[j]
         
-        initial_product = np.convolve(p1, p2).astype(int)
-        
         while len(initial_product) > self.n:
             initial_degree = len(initial_product) - 1
             initial_coeff = initial_product[initial_degree]

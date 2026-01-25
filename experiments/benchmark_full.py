@@ -17,7 +17,7 @@
 # Optional:
 #   python3 -m experiments.benchmark_full --n 64 128 256 512
 #   python3 -m experiments.benchmark_full --mul-trials 400 --ed-trials 100
-#   python3 -m experiments.benchmark_full --q 3329 --sigma 2.5 --seed 1
+#   python3 -m experiments.benchmark_full --q 12289 --sigma 2.5 --seed 1
 
 import os
 import sys
@@ -35,37 +35,42 @@ _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# --- Schoolbook import and adapters ---
 from mqsc_ringlwe.ringlwe_schoolbook import RingLWE as RingLWE_Schoolbook
-# Kyber-style negacyclic NTT (q=3329, n=256) implemented in Python
-from mqsc_ringlwe.ntt_kyber_py import poly_mul as kyber_poly_mul
 
 
-class RingLWE_KyberNTT(RingLWE_Schoolbook):
-    """Adapter: use the Schoolbook RingLWE implementation, but replace polynomial
-    multiplication with Kyber-style NTT multiplication for the Kyber parameter set.
+# ----------------------------
+# Adapter: force no-NumPy schoolbook path
+# ----------------------------
+class RingLWE_Schoolbook_NoNumPy(RingLWE_Schoolbook):
+    """Adapter: force the no-NumPy schoolbook path if available.
 
-    This benchmarks the speed impact of swapping only the poly-mul primitive.
+    Uses:
+      - encrypt_no_numPy / decrypt_no_numPy if they exist
+      - multiply_polynomials_no_numPy if it exists
     """
 
-    def __init__(self, n: int, q: int, sigma: float = 0.0, **kwargs):
-        # RingLWE_Schoolbook in this repo does not accept a `seed` kwarg.
-        # Accept **kwargs so the adapter is robust to callers passing extra params.
-        if n != 256 or q != 3329:
-            raise ValueError(
-                f"Kyber NTT adapter supports only (n,q)=(256,3329). Got (n,q)=({n},{q})."
-            )
-        super().__init__(n=n, q=q, sigma=sigma)
+    def encrypt(self, s, message_bits):
+        if hasattr(self, "encrypt_no_numPy") and callable(getattr(self, "encrypt_no_numPy")):
+            return self.encrypt_no_numPy(s, message_bits)
+        return super().encrypt(s, message_bits)
+
+    def decrypt(self, s, ciphertext):
+        if hasattr(self, "decrypt_no_numPy") and callable(getattr(self, "decrypt_no_numPy")):
+            return self.decrypt_no_numPy(s, ciphertext)
+        return super().decrypt(s, ciphertext)
 
     def multiply_polynomials(self, a, b):
-        # NumPy 2.0: np.array(..., copy=False) can raise if a copy is required.
-        # Use asarray (copy if needed) and ensure contiguous buffers for speed/safety.
-        a_np = np.ascontiguousarray(np.asarray(a, dtype=np.int32) % self.q)
-        b_np = np.ascontiguousarray(np.asarray(b, dtype=np.int32) % self.q)
-        return kyber_poly_mul(a_np, b_np)
+        if hasattr(self, "multiply_polynomials_no_numPy") and callable(getattr(self, "multiply_polynomials_no_numPy")):
+            return self.multiply_polynomials_no_numPy(a, b)
+        return super().multiply_polynomials(a, b)
+# Kyber-style negacyclic NTT (q=3329, n=256) implemented in Python
+# from mqsc_ringlwe.ntt_kyber_py import poly_mul as kyber_poly_mul
+from mqsc_ringlwe.ringlwe_ntt_optimization import RingLWE as RingLWE_NTT
 
 
 # Alias used by the benchmark below
-RingLWE_NTT = RingLWE_KyberNTT
+# RingLWE_NTT = RingLWE_NewNTT
 
 
 def _now_ns() -> int:
@@ -348,11 +353,17 @@ def _fmt_iqr(med, p25, p75) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--q", type=int, default=3329)
+    ap.add_argument("--q", type=int, default=12289)
     ap.add_argument("--sigma", type=float, default=2.5)
     ap.add_argument("--seed", type=int, default=1)
 
-    ap.add_argument("--n", type=int, nargs="*", default=[64, 128, 256, 512])
+    ap.add_argument(
+        "--schoolbook-no-numpy",
+        action="store_true",
+        help="Use encrypt_no_numPy/decrypt_no_numPy (and multiply_polynomials_no_numPy if present) for Schoolbook.",
+    )
+
+    ap.add_argument("--n", type=int, nargs="*", default=[64, 128, 256, 512, 1024])
     ap.add_argument("--mul-trials", type=int, default=300)
     ap.add_argument("--ed-trials", type=int, default=80)
     ap.add_argument("--consistency-trials", type=int, default=200)
@@ -384,13 +395,16 @@ def main():
     print("-" * len(header))
 
     for n in args.n:
-        rlwe_s = RingLWE_Schoolbook(n=n, q=q, sigma=sigma)
+        q_n = q
 
-        # Kyber NTT adapter supports only (n,q)=(256,3329)
+        SchoolbookClass = RingLWE_Schoolbook_NoNumPy if args.schoolbook_no_numpy else RingLWE_Schoolbook
+        rlwe_s = SchoolbookClass(n=n, q=q_n, sigma=sigma)
+
+        # NTT backend
         rlwe_n = None
         ntt_init_err = ""
         try:
-            rlwe_n = RingLWE_NTT(n=n, q=q, sigma=sigma)
+            rlwe_n = RingLWE_NTT(n=n, q=q_n, sigma=sigma)
         except Exception as e:
             ntt_init_err = f"{type(e).__name__}: {e}"
 
@@ -402,7 +416,7 @@ def main():
 
         # ring consistency
         if ok_s and ok_n:
-            cons = _bench_ring_consistency(n=n, q=q, trials=args.consistency_trials, seed=seed + 999)
+            cons = _bench_ring_consistency(n=n, q=q_n, trials=args.consistency_trials, seed=seed + 999)
         else:
             cons = {"supported": False, "reason": f"skip: school_ok={ok_s} ({err_s}) | ntt_ok={ok_n} ({err_n})"}
 

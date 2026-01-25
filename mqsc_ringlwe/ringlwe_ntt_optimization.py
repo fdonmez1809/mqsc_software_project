@@ -93,9 +93,9 @@ class NTTPlan:
     stage_roots_inv: list[np.ndarray]
 
 
-def make_ntt_plan(n: int, q: int) -> NTTPlan:
+def make_ntt_plan(n: int, q: int, mode: str = "auto") -> NTTPlan:
     """
-    Build an NTT plan.
+    Build an NTT plan. mode ∈ {"auto", "negacyclic", "cyclic"}.
 
     - If (q-1) % (2n) == 0: build a NEGACYCLIC plan for Z_q[x]/(x^n + 1)
       using the standard "twist" by powers of psi (a primitive 2n-th root).
@@ -109,16 +109,36 @@ def make_ntt_plan(n: int, q: int) -> NTTPlan:
     if n & (n - 1) != 0:
         raise ValueError("NTT requires n to be a power of two.")
 
-    mode: str
-    if (q - 1) % (2 * n) == 0:
+    # Decide plan mode
+    mode_req = (mode or "auto").lower()
+    if mode_req not in {"auto", "negacyclic", "cyclic"}:
+        raise ValueError(f"Invalid mode={mode!r}. Use 'auto', 'negacyclic', or 'cyclic'.")
+
+    # Auto-prefer negacyclic when possible, otherwise cyclic.
+    if mode_req == "auto":
+        if (q - 1) % (2 * n) == 0:
+            mode = "negacyclic"
+        elif (q - 1) % n == 0:
+            mode = "cyclic"
+        else:
+            raise ValueError(
+                f"Need n | (q-1) for cyclic NTT or (2n) | (q-1) for negacyclic NTT. "
+                f"Here q-1={q-1} not divisible by n={n} nor 2n={2*n}."
+            )
+    elif mode_req == "negacyclic":
+        if (q - 1) % (2 * n) != 0:
+            raise ValueError(
+                f"Requested negacyclic NTT but (q-1) is not divisible by 2n. "
+                f"q-1={q-1}, 2n={2*n}."
+            )
         mode = "negacyclic"
-    elif (q - 1) % n == 0:
+    else:  # mode_req == "cyclic"
+        if (q - 1) % n != 0:
+            raise ValueError(
+                f"Requested cyclic NTT but (q-1) is not divisible by n. "
+                f"q-1={q-1}, n={n}."
+            )
         mode = "cyclic"
-    else:
-        raise ValueError(
-            f"Need n | (q-1) for cyclic NTT or (2n) | (q-1) for negacyclic NTT. "
-            f"Here q-1={q-1} not divisible by n={n} nor 2n={2*n}."
-        )
 
     g = _find_generator_mod_prime(q)
 
@@ -280,7 +300,7 @@ class RingLWE:
         self.sigma = float(sigma)
         self.rng = np.random.default_rng(seed)
 
-        self.plan = make_ntt_plan(self.n, self.q)
+        self.plan = make_ntt_plan(self.n, self.q, mode="auto")
 
         # Keep a readable name for reporting/debugging
         self.ring_mode = self.plan.mode
